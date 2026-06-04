@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker volumes / data
+confluence_documents/
+
+# Air-gapped wheels (use PyPI for standard builds)
+pmt_faq_bot/wheels/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
