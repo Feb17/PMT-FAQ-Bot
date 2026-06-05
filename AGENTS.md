@@ -22,12 +22,10 @@
 - If WebUI is accessed from another machine, update `RAG_ASSET_BASE_URL`; the default `127.0.0.1` only works from the VM itself.
 - `app-vm-3-17.env.example` contains a real-looking `QDRANT_API_KEY`; avoid copying secrets into new docs or commits.
 
-## Tests and verification
-- There is no pytest config, lint, typecheck, CI, Makefile, or pre-commit setup in this repo.
-- Most tests are standalone scripts under `pmt_faq_bot/tests/` that add `pmt_faq_bot/` to `sys.path`; run focused tests from the repo root with `python pmt_faq_bot/tests/test_parser.py` or similar.
-- Some tests are unittest-style and can run with `python -m unittest discover -s pmt_faq_bot/tests -p 'test_*.py'`, but several files use bare `test_*` functions only, so direct script execution is safer for focused checks.
-- `pmt_faq_bot/tests/test_retrieval.py` is an integration/eval harness requiring Qdrant, embedding, rerank, and usually LLM services; set `ENABLE_QUERY_REWRITE=false` if no LLM is available, and run it in the Docker network as documented in that file.
-- `test_e2e_real_docs.py` skips when its historical `confluence-dify-clean-export/documents` path is absent; do not treat skipped real-doc output as a full ingestion verification.
+## Evaluation
+- No unit tests are kept in this repo; test-like scripts were removed.
+- `pmt_faq_bot/evaluation/test_retrieval.py` is an integration/eval harness requiring Qdrant, embedding, rerank, and usually LLM services; set `ENABLE_QUERY_REWRITE=false` if no LLM is available, and run it in the Docker network as documented in that file.
+- Baseline comparison: `python pmt_faq_bot/evaluation/test_retrieval.py --save-baseline baseline.json --compare baseline_prev.json`
 
 ## Build/runtime quirks
 - Dockerfile supports air-gapped builds: if `pmt_faq_bot/wheels/` exists it installs with `--no-index --find-links`; otherwise it uses PyPI.

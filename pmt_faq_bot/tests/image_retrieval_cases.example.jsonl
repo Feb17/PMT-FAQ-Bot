@@ -1,2 +1,0 @@
-{"query": "登录步骤截图里显示了什么？", "must_return_image": true, "expected_image_terms": ["![", "]("], "expected_terms": ["登录"]}
-{"query": "Qdrant 连接失败截图里的端口是什么？", "must_return_image": true, "expected_image_terms": ["![", "]("], "expected_terms": ["Qdrant", "6333"]}

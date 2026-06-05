@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from .bm25 import BM25Encoder
 from .chunker import Chunk, chunk_document
@@ -16,7 +18,12 @@ from .image_manifest import (
     hash_image_records,
     load_processed_images_by_doc_id,
 )
+from .monitor import check_ingest, emit_alerts
+from .observability import IngestMetrics, Timer, save_metrics_jsonl, load_json, save_json
 from .parser import ParsedDocument, parse_file
+
+if TYPE_CHECKING:
+    from .qdrant_store import QdrantStore
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +37,7 @@ class IngestStats:
     skipped: int = 0
     total_chunks: int = 0
     errors: list[str] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
 
 
 def compute_file_hash(
@@ -97,6 +105,9 @@ def run_ingest(
         mode: "auto" (incremental) or "full" (rebuild)
     """
     stats = IngestStats()
+    start_time = time.perf_counter()
+    diff_elapsed = 0.0
+    bm25 = None
 
     from .qdrant_store import QdrantStore
 
@@ -129,68 +140,109 @@ def run_ingest(
                 store.delete_by_doc_id(doc_id)
                 log.debug("Deleted old data for %s (full rebuild)", doc_id)
         else:
+            diff_start = time.perf_counter()
             existing_hashes = store.get_existing_doc_hashes()
             log.info("Existing documents in Qdrant: %d", len(existing_hashes))
             to_add, to_modify, to_delete, to_skip = compute_diff(
                 local_files, existing_hashes, image_records_by_doc_id
             )
-
-        log.info(
-            "Diff: add=%d, modify=%d, delete=%d, skip=%d",
-            len(to_add), len(to_modify), len(to_delete), len(to_skip),
-        )
+            diff_elapsed = time.perf_counter() - diff_start
+            log.info(
+                "Diff: add=%d, modify=%d, delete=%d, skip=%d elapsed=%.1fs",
+                len(to_add), len(to_modify), len(to_delete), len(to_skip),
+                diff_elapsed,
+            )
 
         stats.skipped = len(to_skip)
 
         # --- Delete removed documents ---
-        for doc_id in to_delete:
-            store.delete_by_doc_id(doc_id)
-            stats.deleted += 1
-            log.info("Deleted: %s", doc_id)
+        with Timer("deletion") as t_delete:
+            for doc_id in to_delete:
+                store.delete_by_doc_id(doc_id)
+                stats.deleted += 1
+                log.info("Deleted: %s", doc_id)
+        stats.__dict__["deletion_seconds"] = t_delete.elapsed_ms / 1000.0
 
         # --- Fit or restore BM25 encoder ---
-        bm25 = _prepare_bm25(
-            cfg, store, local_files, to_add, to_modify, to_skip,
-            image_records_by_doc_id,
-        )
+        with Timer("bm25_fit") as t_bm25:
+            bm25 = _prepare_bm25(
+                cfg, store, local_files, to_add, to_modify, to_skip,
+                image_records_by_doc_id,
+            )
+        stats.__dict__["bm25_fit_seconds"] = t_bm25.elapsed_ms / 1000.0
 
         # --- Add new documents ---
-        for i, doc_id in enumerate(to_add, 1):
-            try:
-                n = _ingest_one(
-                    doc_id, local_files[doc_id], source_dir, cfg, store,
-                    embedder, bm25, image_records_by_doc_id.get(doc_id, []),
-                )
-                stats.added += 1
-                stats.total_chunks += n
-                log.info("[%d/%d] Added: %s (%d chunks)", i, len(to_add), doc_id, n)
-            except Exception as exc:
-                msg = f"Error adding {doc_id}: {exc}"
-                log.error(msg)
-                stats.errors.append(msg)
+        with Timer("addition") as t_add:
+            for i, doc_id in enumerate(to_add, 1):
+                try:
+                    n = _ingest_one(
+                        doc_id, local_files[doc_id], source_dir, cfg, store,
+                        embedder, bm25, image_records_by_doc_id.get(doc_id, []),
+                    )
+                    stats.added += 1
+                    stats.total_chunks += n
+                    log.info("[%d/%d] Added: %s (%d chunks)", i, len(to_add), doc_id, n)
+                except Exception as exc:
+                    msg = f"Error adding {doc_id}: {exc}"
+                    log.error(msg)
+                    stats.errors.append(msg)
+        stats.__dict__["addition_seconds"] = t_add.elapsed_ms / 1000.0
 
         # --- Modify changed documents (atomic: write new, then delete old) ---
-        for i, doc_id in enumerate(to_modify, 1):
-            try:
-                old_hash = existing_hashes.get(doc_id, "")
-                n = _ingest_one(
-                    doc_id, local_files[doc_id], source_dir, cfg, store,
-                    embedder, bm25, image_records_by_doc_id.get(doc_id, []),
-                )
-                # Remove old version
-                if old_hash:
-                    store.delete_by_doc_id_and_hash(doc_id, old_hash)
-                stats.modified += 1
-                stats.total_chunks += n
-                log.info("[%d/%d] Modified: %s (%d chunks)", i, len(to_modify), doc_id, n)
-            except Exception as exc:
-                msg = f"Error modifying {doc_id}: {exc}"
-                log.error(msg)
-                stats.errors.append(msg)
+        with Timer("modification") as t_mod:
+            for i, doc_id in enumerate(to_modify, 1):
+                try:
+                    old_hash = existing_hashes.get(doc_id, "")
+                    n = _ingest_one(
+                        doc_id, local_files[doc_id], source_dir, cfg, store,
+                        embedder, bm25, image_records_by_doc_id.get(doc_id, []),
+                    )
+                    if old_hash:
+                        store.delete_by_doc_id_and_hash(doc_id, old_hash)
+                    stats.modified += 1
+                    stats.total_chunks += n
+                    log.info("[%d/%d] Modified: %s (%d chunks)", i, len(to_modify), doc_id, n)
+                except Exception as exc:
+                    msg = f"Error modifying {doc_id}: {exc}"
+                    log.error(msg)
+                    stats.errors.append(msg)
+        stats.__dict__["modification_seconds"] = t_mod.elapsed_ms / 1000.0
 
         # --- Persist BM25 state for query-side reuse ---
         if bm25 is not None and (to_add or to_modify):
             store.save_bm25_state(bm25.to_json())
+
+        stats.elapsed_seconds = time.perf_counter() - start_time
+        log.info("Ingest complete: %s elapsed=%.1fs", stats, stats.elapsed_seconds)
+
+        metrics = IngestMetrics(
+            mode=mode,
+            total_files=stats.total_files,
+            added=stats.added,
+            modified=stats.modified,
+            deleted=stats.deleted,
+            skipped=stats.skipped,
+            total_chunks=stats.total_chunks,
+            errors=list(stats.errors),
+            elapsed_seconds=stats.elapsed_seconds,
+        )
+        metrics.diff_seconds = diff_elapsed
+        metrics.deletion_seconds = getattr(stats, 'deletion_seconds', 0.0)
+        metrics.bm25_fit_seconds = getattr(stats, 'bm25_fit_seconds', 0.0)
+        metrics.addition_seconds = getattr(stats, 'addition_seconds', 0.0)
+        metrics.modification_seconds = getattr(stats, 'modification_seconds', 0.0)
+
+        collection_info = store.collection_info()
+        metrics.points_count = int(collection_info.get("points_count", 0) or 0)
+        metrics.vectors_count = collection_info.get("vectors_count")
+        metrics.collection_status = str(collection_info.get("status", collection_info.get("error", "")))
+
+        ingest_metrics_path = Path(os.getenv("INGEST_METRICS_PATH", "./ingest_metrics.jsonl"))
+        save_metrics_jsonl(metrics, ingest_metrics_path)
+        save_json("ingest_snapshot.json", metrics.to_dict())
+
+        alerts = check_ingest(stats.errors, stats.elapsed_seconds)
+        emit_alerts(alerts)
 
     finally:
         embedder.close()

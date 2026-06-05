@@ -13,6 +13,7 @@ import httpx
 
 from .bm25 import BM25Encoder
 from .config import Config
+from .observability import RetrievalMetrics, StageLatency, Timer
 
 logger = logging.getLogger(__name__)
 
@@ -55,18 +56,61 @@ class RetrievalPipeline:
         top_k: int = 5,
         recall_k: int = 20,
         exclude_low_value: bool = True,
-    ) -> list[RetrievedChunk]:
+        collect_metrics: bool = False,
+    ) -> list[RetrievedChunk] | tuple[list[RetrievedChunk], RetrievalMetrics]:
         """Full pipeline: embed → hybrid recall → rerank → top_k chunks."""
-        dense_vec = self._embed_dense(query)
-        sparse_vec = self._embed_sparse(query)
-
-        candidates = self._hybrid_recall(
-            dense_vec, sparse_vec, recall_k, exclude_low_value
+        metrics: RetrievalMetrics | None = (
+            RetrievalMetrics(query=query, query_length=len(query)) if collect_metrics else None
         )
+        dense_vec: list[float] = []
+        sparse_vec: Optional[dict] = None
+        candidates: list[dict] = []
+        reranked: list[dict] = []
 
-        reranked = self._rerank(query, candidates, top_k)
+        with Timer("dense_embed") as t_dense:
+            try:
+                dense_vec = self._embed_dense(query)
+            except Exception as exc:
+                if metrics is not None:
+                    metrics.stages.append(t_dense.to_latency_error(str(exc)))
+                raise
+        if metrics is not None and not metrics.stages:
+            metrics.stages.append(t_dense.to_latency())
 
-        return [
+        sparse_stage_name = "sparse_embed_skip" if not self._cfg.enable_bm25 else "sparse_embed"
+        with Timer(sparse_stage_name) as t_sparse:
+            try:
+                sparse_vec = self._embed_sparse(query)
+            except Exception as exc:
+                if metrics is not None:
+                    metrics.stages.append(t_sparse.to_latency_error(str(exc)))
+                raise
+        if metrics is not None and len(metrics.stages) < 2:
+            metrics.stages.append(StageLatency(stage=sparse_stage_name, ms=t_sparse.elapsed_ms))
+
+        with Timer("qdrant_recall") as t_recall:
+            try:
+                candidates = self._hybrid_recall(
+                    dense_vec, sparse_vec, recall_k, exclude_low_value
+                )
+            except Exception as exc:
+                if metrics is not None:
+                    metrics.stages.append(t_recall.to_latency_error(str(exc)))
+                raise
+        if metrics is not None and len(metrics.stages) < 3:
+            metrics.stages.append(t_recall.to_latency())
+
+        with Timer("rerank") as t_rerank:
+            try:
+                reranked = self._rerank(query, candidates, top_k)
+            except Exception as exc:
+                if metrics is not None:
+                    metrics.stages.append(t_rerank.to_latency_error(str(exc)))
+                raise
+        if metrics is not None and len(metrics.stages) < 4:
+            metrics.stages.append(t_rerank.to_latency())
+
+        results = [
             RetrievedChunk(
                 chunk_id=hit["payload"].get("chunk_id", ""),
                 chunk_type=hit["payload"].get("chunk_type", ""),
@@ -81,6 +125,24 @@ class RetrievalPipeline:
             )
             for hit in reranked
         ]
+
+        if not collect_metrics:
+            return results
+
+        assert metrics is not None
+        metrics.candidates_count = len(candidates)
+        metrics.reranked_count = len(reranked)
+        metrics.top_rerank_score = max((hit.get("rerank_score", 0.0) for hit in reranked), default=0.0)
+        metrics.total_ms = sum(stage.ms for stage in metrics.stages)
+        logger.debug(
+            "Retrieval latencies: dense=%.1fms sparse=%.1fms qdrant=%.1fms rerank=%.1fms total=%.1fms",
+            next((s.ms for s in metrics.stages if s.stage == "dense_embed"), 0.0),
+            next((s.ms for s in metrics.stages if s.stage in ("sparse_embed", "sparse_embed_skip")), 0.0),
+            next((s.ms for s in metrics.stages if s.stage == "qdrant_recall"), 0.0),
+            next((s.ms for s in metrics.stages if s.stage == "rerank"), 0.0),
+            metrics.total_ms,
+        )
+        return results, metrics
 
     def close(self) -> None:
         self._client.close()

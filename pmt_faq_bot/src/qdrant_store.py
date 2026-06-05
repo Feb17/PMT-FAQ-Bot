@@ -23,6 +23,7 @@ from qdrant_client.models import (
 from .chunker import Chunk
 from .config import Config
 from .embedder import EmbeddingResult
+from .observability import CollectionHealth
 
 log = logging.getLogger(__name__)
 
@@ -209,14 +210,36 @@ class QdrantStore:
         """Return basic collection statistics."""
         try:
             info = self._client.get_collection(self._collection)
+            segments_count = getattr(info, "segments_count", 0)
+            disk_data_size = None
+            try:
+                http_info = self._client.http.collections_api.get_collection(
+                    collection_name=self._collection
+                )
+                disk_data_size = getattr(http_info.result, "disk_data_size", None)
+            except Exception:
+                pass
             return {
                 "collection": self._collection,
                 "points_count": info.points_count,
                 "vectors_count": getattr(info, "vectors_count", None),
+                "segments_count": segments_count,
+                "disk_data_size": disk_data_size,
                 "status": str(info.status),
             }
         except Exception as exc:
             return {"collection": self._collection, "error": str(exc)}
+
+    def collection_health(self) -> CollectionHealth:
+        """Return a structured CollectionHealth snapshot."""
+        info = self.collection_info()
+        return CollectionHealth(
+            collection_name=info.get("collection", self._collection),
+            points_count=info.get("points_count", 0),
+            vectors_count=info.get("vectors_count"),
+            segments_count=info.get("segments_count", 0),
+            status=info.get("status", "unknown"),
+        )
 
     def close(self) -> None:
         self._client.close()

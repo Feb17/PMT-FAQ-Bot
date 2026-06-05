@@ -1,14 +1,20 @@
-"""End-to-end retrieval test: Dense recall + Jina Rerank.
+"""End-to-end retrieval regression test: Dense recall + Jina Rerank.
+
+Dataset: Bosch ADC toolchain FAQ (CAAS / CVD / JFrog / Bitbucket / Jenkins / Arena / COS)
+14 Chinese documents covering Tencent private cloud toolchain account/permission/usage guides.
 
 Usage (on the server, from a container on llm-net):
-    docker run --rm --network llm-net \
-      -e QDRANT_URL=http://qdrant:6333 \
-      -e EMBED_URL=http://tei-embedding:80 \
-      -e RERANK_URL=http://tei-rerank:80 \
-      -e QDRANT_API_KEY=<key> \
-      -v /opt/PMT-FAQ-Bot/pmt_faq_bot/tests/test_retrieval.py:/app/test_retrieval.py \
-      -v /opt/PMT-FAQ-Bot/pmt_faq_bot:/out \
+    docker run --rm --network llm-net \\
+      -e QDRANT_URL=http://qdrant:6333 \\
+      -e EMBED_URL=http://tei-embedding:80 \\
+      -e RERANK_URL=http://tei-rerank:80 \\
+      -e QDRANT_API_KEY=<key> \\
+      -v /opt/PMT-FAQ-Bot/pmt_faq_bot/evaluation/test_retrieval.py:/app/test_retrieval.py \\
+      -v /opt/PMT-FAQ-Bot/pmt_faq_bot:/out \\
       --entrypoint python pmt_faq_bot:latest test_retrieval.py --output /out/retrieval_report.txt
+
+Run directly on the server:
+    python3 pmt_faq_bot/evaluation/test_retrieval.py --save-baseline baseline.json --report-json report.json
 
 The --output flag writes the report directly to a UTF-8 file inside the
 container, which avoids any host-side (PowerShell / cmd) re-encoding of the
@@ -17,16 +23,26 @@ redirected stdout stream.
 
 import argparse
 import io
+import json
 import os
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import median
 from typing import Optional
+
+# Ensure pmt_faq_bot/ is on sys.path so that `from src.bm25 import ...` works
+# when running directly on the host (not via Docker where WORKDIR=/app).
+_syspath_root = Path(__file__).resolve().parents[1]
+if str(_syspath_root) not in sys.path:
+    sys.path.insert(0, str(_syspath_root))
 
 import httpx
 
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-EMBED_URL = os.getenv("EMBED_URL", "http://localhost:8001")
-RERANK_URL = os.getenv("RERANK_URL", "http://localhost:8002")
-LLM_URL = os.getenv("LLM_URL", "http://vllm-chat:8000")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://10.203.97.4:6333")
+EMBED_URL = os.getenv("EMBED_URL", "http://10.203.97.4:8001")
+RERANK_URL = os.getenv("RERANK_URL", "http://10.203.97.4:8002")
+LLM_URL = os.getenv("LLM_URL", "http://10.203.97.4:8000")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3-235B-A22B-Instruct-2507")
 API_KEY = os.getenv("QDRANT_API_KEY", "")
 COLLECTION = os.getenv("COLLECTION_NAME", "PMT-FAQ")
@@ -40,106 +56,160 @@ ENABLE_QUERY_REWRITE = os.getenv("ENABLE_QUERY_REWRITE", "true").lower() in ("1"
 # Each test case: (category, query, list of doc_id substrings expected to appear in top-K)
 # Use "NO_MATCH" to assert the system should NOT confidently return any doc
 # (accepts any result but flags if rerank score > 0.3)
+#
+# Dataset: Bosch ADC toolchain FAQ (CAAS / CVD / JFrog / Bitbucket / Jenkins / Arena / COS)
+# 14 documents (14 ingested markdown pages), all Chinese with English technical terms.
 TEST_CASES: list[tuple[str, str, list[str]]] = [
     # --- A. Conceptual (semantic understanding) ---
-    ("concept-en", "What is WSUS and what does it do?",
-     ["disc-wsus-service"]),
+    ("concept-cn", "什么是 CAAS 账号？",
+     ["caas"]),
 
-    ("concept-cn", "什么是 server hardening？",
-     ["os-hardening-implementation", "hardening"]),
+    ("concept-cn", "什么是 CVD 远程桌面？",
+     ["cvd"]),
 
-    ("concept-cn", "Nutanix 的快照机制是怎么工作的？",
-     ["nutanix-ahv-data-protection"]),
+    ("concept-cn", "什么是 Arena 平台的 DMP 应龙？",
+     ["arena", "dmp"]),
 
-    ("concept-en", "What data types does Redis support?",
-     ["redis"]),
+    ("concept-en", "What is CVD remote desktop used for?",
+     ["cvd"]),
 
-    ("concept-mix", "介绍下 DISC foundational services",
-     ["disc-foundational-services"]),
+    ("concept-cn", "COS 桶是什么？",
+     ["cos"]),
+
+    ("concept-cn", "oneIDM 和工具链权限有什么关系？",
+     ["faq-721033694", "caas"]),
+
+    ("concept-cn", "什么是 Artifactory 的 Access Token？",
+     ["jfrog", "721033694"]),
+
+    ("concept-cn", "专区 ADC 是什么意思？",
+     ["caas", "cvd"]),
 
     # --- B. Fact / parameter lookup (keyword-heavy) ---
-    ("fact-en", "Which server is the Veeam VBR Server?",
-     ["backup-recovery"]),
+    ("fact-cn", "CAAS 账号的用户名格式是什么？",
+     ["caas"]),
 
-    ("fact-cn", "Oracle 数据库的归档日志多久备份一次？",
-     ["backup-recovery"]),
+    ("fact-cn", "Bitbucket 的访问 URL 是什么？",
+     ["bitbucket"]),
 
-    ("fact-cn", "CCTV 监控视频保留多少天？",
-     ["cctv"]),
+    ("fact-en", "What is the Bitbucket access URL?",
+     ["bitbucket"]),
 
-    ("fact-en", "When is the Nutanix snapshot scheduled?",
-     ["nutanix-ahv-data-protection"]),
+    ("fact-cn", "申请 CVD 需要在 IDM 搜索什么角色名称？",
+     ["cvd"]),
 
-    ("fact-cn", "RHEL 安装的时区应该设置成什么？",
-     ["rhel-os-implementation"]),
+    ("fact-cn", "Jenkins 的 admin IDM role 是什么？",
+     ["jenkins"]),
 
-    ("fact-en", "What is innodb_buffer_pool_size default value?",
-     ["mysql"]),
+    ("fact-cn", "哪些项目可以写在 CAAS 申请理由里？",
+     ["caas"]),
 
-    ("fact-cn", "漏洞扫描计划的频率是多少？",
-     ["vulnerability-management"]),
+    ("fact-cn", "hosts 文件中 bitbucket.prod.boscharena.ai 对应的 IP 是多少？",
+     ["bitbucketfaq", "faq-866374506"]),
+
+    ("fact-cn", "CVD 不活跃多久会被系统回收？",
+     ["cvd"]),
+
+    ("fact-cn", "乘黄 FMP 是做什么的？",
+     ["arena", "fmp"]),
+
+    ("fact-cn", "CAAS 初始密码为什么不能用？",
+     ["caas", "866359274"]),
 
     # --- C. How-to / procedural ---
-    ("howto-cn", "如何在 Windows Server 上手动部署硬化策略？",
-     ["os-hardening-implementation"]),
+    ("howto-cn", "如何申请 CAAS 账号？",
+     ["caas"]),
 
-    ("howto-en", "How to report a security incident in Bosch?",
-     ["security-incident-management"]),
+    ("howto-en", "How to change CAAS password?",
+     ["caas"]),
 
-    ("howto-cn", "Linux 服务器如何加入 AD 域？",
-     ["active-directory-integration"]),
+    ("howto-cn", "如何在办公电脑上直接访问 Bitbucket 而不通过 CVD？",
+     ["bitbucketfaq"]),
 
-    ("howto-en", "How to restore a VM using Veeam?",
-     ["data-restore-for-vm"]),
+    ("howto-cn", "如何申请 JFrog Artifactory 的制品仓权限？",
+     ["jfrog"]),
 
-    ("howto-cn", "如何申请 CoDC 机房的物理访问权限？",
-     ["physical-access-management-for-codc"]),
+    ("howto-cn", "如何在 Citrix Workspace 中修改 CAAS 密码？",
+     ["cvd"]),
 
-    ("howto-en", "How to upgrade Cisco Nexus switch IOS?",
-     ["network-operations-runbook"]),
+    ("howto-en", "How to install Citrix Workspace on Linux to access ADC zone?",
+     ["cvd"]),
 
-    ("howto-cn", "ME 环境下如何集成 RB-PAM？",
-     ["rb-pam-integration"]),
+    ("howto-cn", "CVD 和办公电脑之间如何互传文件？",
+     ["faq-866374506"]),
 
-    ("howto-en", "How to handle Veeam backup alerts?",
-     ["veeam-alert-handling"]),
+    ("howto-cn", "如何获取办公电脑的临时管理员权限？",
+     ["faq-866374506", "721033694"]),
 
-    # --- D. Exact keyword / entity lookup ---
-    ("entity-en", "What is SZHRMEBCKVM001?",
-     ["backup-recovery"]),
+    ("howto-cn", "如何申请 COS 桶的读写权限？",
+     ["cos"]),
 
-    ("entity-en", "Where is DISC-WIN-Base-Hardening used?",
-     ["os-hardening-implementation", "patch-management"]),
+    ("howto-cn", "如何在 Jenkins 里创建 Access Token？",
+     ["faq-721033694"]),
 
-    ("entity-cn", "MongoDB 分片集群部署文档在哪里？",
-     ["mongo-db"]),
+    # --- D. Exact keyword / entity / troubleshooting lookup ---
+    ("entity-cn", "Bitbucket 克隆报错 fatal the remote end hung up unexpectedly 怎么解决？",
+     ["721033694"]),
+
+    ("entity-cn", "CAAS 账号被冻结了怎么办？",
+     ["721033694"]),
+
+    ("entity-cn", "JFrog API key 不再使用，如何迁移到 Access Token？",
+     ["jfrog", "721033694"]),
+
+    ("entity-cn", "浏览器开了代理，无法访问 bitbucket 和 jfrog 怎么办？",
+     ["faq-866374506", "721033694"]),
+
+    ("entity-cn", "项目 PJW3 的 Bitbucket 代码仓管理员是谁？",
+     ["bitbucket"]),
+
+    ("entity-cn", "应龙 DMP 和玄武 Unisim 分别是什么？",
+     ["arena"]),
 
     # --- E. Broad / cross-document ---
-    ("broad-cn", "Windows Server 的月度打补丁流程",
-     ["windows-server-patch-management", "patch-management"]),
+    ("broad-cn", "我要申请 Bitbucket 代码仓权限和 JFrog 制品仓权限，分别需要什么前提条件和步骤？",
+     ["bitbucket", "jfrog"]),
 
-    ("broad-en", "How do we back up Oracle RAC databases?",
-     ["backup-recovery", "create-backup-job-for-oracle"]),
+    ("broad-cn", "在 ADC 专区工作，需要哪些账号和工具？",
+     ["caas", "cvd", "faq-721033694"]),
 
-    ("broad-cn", "网络设备的配置备份怎么做？",
-     ["network-operations-runbook"]),
+    ("broad-cn", "hosts 文件里需要配置哪些域名才能直接访问 ADC 工具链？",
+     ["faq-866374506", "bitbucketfaq"]),
+
+    ("broad-cn", "Arena 平台有哪些子系统，各自的用途是什么？",
+     ["arena"]),
 
     # --- F. No-match (should return low confidence / low rerank scores) ---
-    ("nomatch", "How to configure Kubernetes Ingress controller?",
+    ("nomatch", "How to deploy a Kubernetes cluster on AWS EKS?",
      ["NO_MATCH"]),
 
-    ("nomatch", "What is AWS S3 pricing model?",
+    ("nomatch", "Python 中如何使用 requests 库发送 POST 请求？",
      ["NO_MATCH"]),
 
-    ("nomatch", "如何搭建一个 Qdrant 向量数据库？",
+    ("nomatch", "如何配置 TortoiseGit 连接 GitHub 仓库？",
+     ["NO_MATCH"]),
+
+    ("nomatch", "What is the price of Bosch XC3 ultrasonic sensor?",
+     ["NO_MATCH"]),
+
+    ("nomatch", "How do I train a PyTorch transformer model for image classification?",
      ["NO_MATCH"]),
 
     # --- G. Edge cases ---
-    ("edge-cn", "ISA-CN 团队负责什么服务？",
-     ["dedicated-infrastructure-services", "disc"]),
+    ("edge-cn", "CAAS",
+     ["caas"]),
 
-    ("edge-cn", "RHEL 服务器的代理如何设置？",
-     ["rhel-os-implementation"]),
+    ("edge-cn", "专区",
+     ["caas", "cvd"]),
+
+    ("edge-mix", "How to 申请 JFrog Artifactory 的 permission?",
+     ["jfrog"]),
+
+    ("edge-cn", "我想从零开始接入 ADC 专区做开发，需要申请 CAAS 账号、CVD 远程桌面、Bitbucket 代码仓、JFrog 制品仓和 Jenkins 流水线权限，整个流程分别需要哪些 IDM 角色、hosts 配置、以及各个平台的访问 URL？请详细说明步骤。",
+     ["caas", "cvd", "bitbucket", "jfrog", "jenkins"]),
+
+    ("edge-cn", "ADC",
+     ["caas", "cvd"]),
 ]
 
 
@@ -474,7 +544,7 @@ def evaluate_case(query: str, expected: list[str]) -> dict:
 # Rendering
 # ---------------------------------------------------------------------------
 
-def print_hit(rank: int, score: float, p: dict, key: str, extra: dict = None) -> None:
+def print_hit(rank: int, score: float, p: dict, key: str, extra: Optional[dict] = None) -> None:
     doc_id = p.get("doc_id", "")[:45]
     section = p.get("section_title", "")[:25]
     content = (p.get("content", "") or "")[:140].replace("\n", " ")
@@ -509,7 +579,7 @@ def run_case(category: str, query: str, expected: list[str]) -> dict:
 
     verdict = _verdict(result)
     print(f"\nVERDICT: {verdict}")
-    return {"category": category, "query": query, "result": result, "verdict": verdict}
+    return {"category": category, "query": query, "expected": expected, "result": result, "verdict": verdict}
 
 
 def _verdict(r: dict) -> str:
@@ -522,6 +592,47 @@ def _verdict(r: dict) -> str:
     if r["dense_hit_at_5"]:
         return "WEAK (dense@5 hit, rerank missed)"
     return "FAIL"
+
+
+def compute_mrr(results: list[dict], k: int, stage: str) -> float:
+    total = 0.0
+    count = 0
+    for r in results:
+        if r["result"]["is_nomatch"]:
+            continue
+        count += 1
+        pool = r["result"].get(stage, [])[:k]
+        rr = 0.0
+        for idx, hit in enumerate(pool, 1):
+            if match_doc_id(hit.get("payload", {}).get("doc_id", ""), r["expected"]):
+                rr = 1.0 / idx
+                break
+        total += rr
+    return total / count if count else 0.0
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    vals = sorted(values)
+    if len(vals) == 1:
+        return vals[0]
+    pos = (len(vals) - 1) * pct / 100.0
+    lo = int(pos)
+    hi = min(lo + 1, len(vals) - 1)
+    frac = pos - lo
+    return vals[lo] * (1 - frac) + vals[hi] * frac
+
+
+def _load_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _dump_json(path: str, data: dict) -> None:
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
 
 
 def _force_utf8_stdio() -> None:
@@ -584,6 +695,9 @@ def _parse_args() -> argparse.Namespace:
         help="Write the report to this UTF-8 file in addition to stdout. "
              "Also reads RETRIEVAL_REPORT_PATH env var.",
     )
+    parser.add_argument("--save-baseline", help="Save full run results as JSON baseline.")
+    parser.add_argument("--compare", help="Compare current run against a JSON baseline.")
+    parser.add_argument("--report-json", help="Write structured JSON report.")
     return parser.parse_args()
 
 
@@ -609,6 +723,36 @@ def main() -> None:
             results.append(run_case(category, query, expected))
         except Exception as exc:
             print(f"ERROR for {query!r}: {exc}", file=sys.stderr)
+
+    expected_by_case = {(c, q): e for c, q, e in TEST_CASES}
+
+    if args.compare:
+        baseline = _load_json(args.compare)
+        baseline_cases = {(c["category"], c["query"]): c for c in baseline.get("cases", [])}
+        print(f"\n\n{'#'*90}\nBASELINE COMPARISON\n{'#'*90}")
+        regressions = improvements = unchanged = missing = 0
+        for r in results:
+            prev = baseline_cases.get((r["category"], r["query"]))
+            if prev is None:
+                missing += 1
+                continue
+            curr_hit = bool(r["result"]["rerank_hit_at_1"])
+            prev_hit = bool(prev.get("rerank_hit_at_1"))
+            curr_score = float(r["result"]["top_rerank_score"])
+            prev_score = float(prev.get("top_rerank_score", 0.0))
+            curr_verdict = r["verdict"]
+            prev_verdict = str(prev.get("verdict", ""))
+            if curr_verdict == prev_verdict and curr_hit == prev_hit and abs(curr_score - prev_score) < 1e-9:
+                unchanged += 1
+            elif curr_hit and not prev_hit:
+                improvements += 1
+                print(f"+ {r['category']}: {r['query']} ({prev_verdict} -> {curr_verdict})")
+            elif prev_hit and not curr_hit:
+                regressions += 1
+                print(f"- {r['category']}: {r['query']} ({prev_verdict} -> {curr_verdict})")
+            else:
+                unchanged += 1
+        print(f"Regressions: {regressions}  Improvements: {improvements}  Unchanged: {unchanged}  Missing: {missing}")
 
     # --- Summary ---
     print(f"\n\n{'#'*90}\nSUMMARY\n{'#'*90}\n")
@@ -644,6 +788,73 @@ def main() -> None:
     print(f"  + LLM Rewrite @1: {_pct(multi_at_1)}   @5: {_pct(multi_at_5)}")
     print(f"  + Rerank      @1: {_pct(rerank_at_1)}   @5: {_pct(rerank_at_5)}")
     print(f"No-match correct: {nomatch_ok}/{nomatch_total}")
+
+    print(f"  Dense MRR@1: {compute_mrr(results, 1, 'dense_candidates'):.3f}   MRR@5: {compute_mrr(results, 5, 'dense_candidates'):.3f}")
+    print(f"  Hybrid MRR@1: {compute_mrr(results, 1, 'hybrid_only_candidates'):.3f}   MRR@5: {compute_mrr(results, 5, 'hybrid_only_candidates'):.3f}")
+    print(f"  Multi MRR@1: {compute_mrr(results, 1, 'candidates'):.3f}   MRR@5: {compute_mrr(results, 5, 'candidates'):.3f}")
+    print(f"  Rerank MRR@1: {compute_mrr(results, 1, 'reranked'):.3f}   MRR@5: {compute_mrr(results, 5, 'reranked'):.3f}")
+
+    print("\nPer-Category Breakdown")
+    print("======================")
+    print(f"{'Category':<14}{'N':>4}{'Pass@1(Rerank)':>18}{'MRR@5':>10}{'AvgRerankScore':>18}")
+    for cat in sorted({r['category'] for r in results}):
+        cr = [r for r in results if r["category"] == cat]
+        n = len(cr)
+        pass1 = (sum(1 for r in cr if r["result"]["rerank_hit_at_1"]) / n * 100) if n else 0.0
+        mrr5 = compute_mrr(cr, 5, "reranked")
+        avg_score = sum(r["result"]["top_rerank_score"] for r in cr) / n if n else 0.0
+        print(f"{cat:<14}{n:>4}{pass1:>17.1f}%{mrr5:>10.3f}{avg_score:>18.3f}")
+
+    scores = [r["result"]["top_rerank_score"] for r in results]
+    print("\nRerank Score Distribution")
+    print("=========================")
+    print(f"Min: {min(scores) if scores else 0:.3f}  P25: {_percentile(scores, 25):.3f}  Median: {median(scores) if scores else 0:.3f}  P75: {_percentile(scores, 75):.3f}  Max: {max(scores) if scores else 0:.3f}")
+
+    warning_pct = float(os.getenv("ALERT_PASS_RATE_WARNING_PCT", "0") or "0")
+    if warning_pct:
+        pass_rate = rerank_at_1 / answerable * 100 if answerable else 0.0
+        if pass_rate < warning_pct:
+            print(f"[warn] Rerank pass@1 {pass_rate:.1f}% below warning threshold {warning_pct:.1f}%")
+
+    report = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            "total": total,
+            "answerable": answerable,
+            "nomatch_total": nomatch_total,
+            "dense_at_1": dense_at_1,
+            "dense_at_5": dense_at_5,
+            "hybrid_at_1": hybrid_at_1,
+            "hybrid_at_5": hybrid_at_5,
+            "multi_at_1": multi_at_1,
+            "multi_at_5": multi_at_5,
+            "rerank_at_1": rerank_at_1,
+            "rerank_at_5": rerank_at_5,
+        },
+        "cases": [
+            {
+                "category": r["category"],
+                "query": r["query"],
+                "expected": expected_by_case.get((r["category"], r["query"]), []),
+                "verdict": r["verdict"],
+                "dense_hit_at_1": r["result"]["dense_hit_at_1"],
+                "dense_hit_at_5": r["result"]["dense_hit_at_5"],
+                "hybrid_hit_at_1": r["result"]["hybrid_hit_at_1"],
+                "hybrid_hit_at_5": r["result"]["hybrid_hit_at_5"],
+                "multi_hit_at_1": r["result"]["multi_hit_at_1"],
+                "multi_hit_at_5": r["result"]["multi_hit_at_5"],
+                "rerank_hit_at_1": r["result"]["rerank_hit_at_1"],
+                "rerank_hit_at_5": r["result"]["rerank_hit_at_5"],
+                "top_rerank_score": r["result"]["top_rerank_score"],
+            }
+            for r in results
+        ],
+    }
+
+    if args.save_baseline:
+        _dump_json(args.save_baseline, report)
+    if args.report_json:
+        _dump_json(args.report_json, report)
 
     # Failures
     failures = [r for r in results if "FAIL" in r["verdict"] or "WEAK" in r["verdict"]]
