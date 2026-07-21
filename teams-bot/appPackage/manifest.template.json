@@ -1,0 +1,51 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "{{MANIFEST_VERSION}}",
+  "id": "{{TEAMS_APP_ID}}",
+  "packageName": "com.example.pmtfaqbot",
+  "developer": {
+    "name": "{{TEAMS_BOT_DEVELOPER_NAME}}",
+    "websiteUrl": "{{TEAMS_BOT_DEVELOPER_WEBSITE}}",
+    "privacyUrl": "{{TEAMS_BOT_DEVELOPER_PRIVACY_URL}}",
+    "termsOfUseUrl": "{{TEAMS_BOT_DEVELOPER_TERMS_URL}}"
+  },
+  "name": {
+    "short": "PMT FAQ Bot",
+    "full": "PMT FAQ Bot"
+  },
+  "description": {
+    "short": "FAQ bot powered by PMT RAG",
+    "full": "A minimal Microsoft 365 Agents SDK bot that answers FAQ questions from the PMT RAG backend."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#6264A7",
+  "bots": [
+    {
+      "botId": "{{MICROSOFT_APP_ID}}",
+      "scopes": ["personal", "team", "groupchat"],
+      "isNotificationOnly": false,
+      "supportsFiles": false,
+      "commandLists": [
+        {
+          "scopes": ["personal", "team", "groupchat"],
+          "commands": [
+            { "title": "help", "description": "Show bot help" },
+            { "title": "status", "description": "Check RAG health" },
+            { "title": "ask", "description": "Ask a question" },
+            { "title": "search", "description": "Search the FAQ" }
+          ]
+        }
+      ]
+    }
+  ],
+  "validDomains": [
+    "{{TEAMS_BOT_DOMAIN}}",
+    "{{RAG_ASSET_BASE_URL_HOST}}"
+  ],
+  "permissions": [],
+  "showLoadingIndicator": false
+}

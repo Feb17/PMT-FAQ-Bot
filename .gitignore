@@ -6,8 +6,13 @@ __pycache__/
 dist/
 *.egg
 
+# Node / TypeScript
+node_modules/
+teams-bot/dist/
+
 # Environment
 .env
+teams-bot/.env
 
 # IDE
 .idea/
